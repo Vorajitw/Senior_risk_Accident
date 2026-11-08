@@ -1,4 +1,14 @@
 import {
+  collection,
+  doc,
+  setDoc,
+  deleteDoc,
+  onSnapshot,
+  query,
+  where,
+} from 'firebase/firestore';
+import { db, auth } from './authService';
+import {
   QUESTIONS,
   SECTIONS,
   AssessmentRecord,
@@ -1242,8 +1252,22 @@ export function clearDeletedRoadHazards(): void {
 }
 
 /**
- * Merges INITIAL_ROAD_HAZARDS (HAZ-001 .. HAZ-005) with any stored/custom hazards so
- * all 5 core hazards (including HAZ-005) are always present even if an older browser cache only had 4 items.
+ * Detects and filters out the synthetic placeholder HAZ-005 that was temporarily seeded,
+ * ensuring only the user's real HAZ-005 (from Google AI Studio / Firestore / Google Sheets) is kept.
+ */
+function isSyntheticPlaceholderHaz005(item: RoadHazardPoint): boolean {
+  if (!item) return false;
+  return (
+    item.id === 'HAZ-005' &&
+    item.title ===
+      'จุดเสี่ยงทางข้ามถนน 4 เลนหน้าชุมชนบ้านชะเมา หมู่ 6 (ไม่มีเกาะกลางพักรอ 2 จังหวะ)' &&
+    item.reportedBy === 'นางพวงรัตน์ พรหมทอง (อสม. หมู่ 6 บ้านชะเมา)'
+  );
+}
+
+/**
+ * Merges INITIAL_ROAD_HAZARDS (HAZ-001 .. HAZ-004) with any stored/custom/Firestore hazards
+ * (such as the user's real HAZ-005 created in Google AI Studio).
  */
 export function mergeRoadHazardsWithDefaults(
   stored: RoadHazardPoint[]
@@ -1251,17 +1275,18 @@ export function mergeRoadHazardsWithDefaults(
   const deletedIds = getDeletedHazardIds();
   const byId = new Map<string, RoadHazardPoint>();
 
-  // 1. Seed all core INITIAL_ROAD_HAZARDS (HAZ-001 to HAZ-005) unless explicitly deleted
+  // 1. Seed base INITIAL_ROAD_HAZARDS (HAZ-001 to HAZ-004) unless explicitly deleted
   for (const initHaz of INITIAL_ROAD_HAZARDS) {
-    if (!deletedIds.has(initHaz.id)) {
+    if (!deletedIds.has(initHaz.id) && !isSyntheticPlaceholderHaz005(initHaz)) {
       byId.set(initHaz.id, initHaz);
     }
   }
 
-  // 2. Overlay stored/user-created hazards (user edits or custom HAZ-005/HAZ-006 take priority)
+  // 2. Overlay stored/user-created/Firestore hazards (real HAZ-005, HAZ-006, or user edits take priority)
   for (const item of stored) {
     if (!item || !item.id) continue;
     if (deletedIds.has(item.id)) continue;
+    if (isSyntheticPlaceholderHaz005(item)) continue;
     const base = byId.get(item.id);
     byId.set(item.id, {
       ...base,
@@ -1272,7 +1297,7 @@ export function mergeRoadHazardsWithDefaults(
     });
   }
 
-  // Sort by HAZ-xxx number ascending so HAZ-001, HAZ-002, HAZ-003, HAZ-004, HAZ-005 appear in clear order
+  // Sort by HAZ-xxx number ascending so HAZ-001, HAZ-002, HAZ-003, HAZ-004, HAZ-005 appear in order
   return Array.from(byId.values()).sort((a, b) => {
     const numA = parseInt(a.id.replace(/\D+/g, ''), 10) || 999;
     const numB = parseInt(b.id.replace(/\D+/g, ''), 10) || 999;
@@ -1288,9 +1313,9 @@ function openHazardsIndexedDB(): Promise<IDBDatabase | null> {
     try {
       const req = window.indexedDB.open(ROAD_HAZARDS_IDB_NAME, 1);
       req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(ROAD_HAZARDS_IDB_STORE)) {
-          db.createObjectStore(ROAD_HAZARDS_IDB_STORE);
+        const dbIdb = req.result;
+        if (!dbIdb.objectStoreNames.contains(ROAD_HAZARDS_IDB_STORE)) {
+          dbIdb.createObjectStore(ROAD_HAZARDS_IDB_STORE);
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -1302,7 +1327,7 @@ function openHazardsIndexedDB(): Promise<IDBDatabase | null> {
 }
 
 /**
- * Synchronously loads initial road hazards from localStorage merged with INITIAL_ROAD_HAZARDS (HAZ-001 to HAZ-005)
+ * Synchronously loads initial road hazards from localStorage merged with INITIAL_ROAD_HAZARDS
  */
 export function loadRoadHazardsSync(): RoadHazardPoint[] {
   try {
@@ -1320,16 +1345,15 @@ export function loadRoadHazardsSync(): RoadHazardPoint[] {
 }
 
 /**
- * Asynchronously loads full road hazards (including full high-res base64 photos) from IndexedDB or localStorage,
- * always ensuring HAZ-001 through HAZ-005 are present.
+ * Asynchronously loads full road hazards (including full high-res base64 photos) from IndexedDB or localStorage
  */
 export async function loadRoadHazardsAsync(): Promise<RoadHazardPoint[]> {
   try {
-    const db = await openHazardsIndexedDB();
-    if (db) {
+    const dbIdb = await openHazardsIndexedDB();
+    if (dbIdb) {
       const idbResult = await new Promise<RoadHazardPoint[] | null>((resolve) => {
         try {
-          const tx = db.transaction(ROAD_HAZARDS_IDB_STORE, 'readonly');
+          const tx = dbIdb.transaction(ROAD_HAZARDS_IDB_STORE, 'readonly');
           const store = tx.objectStore(ROAD_HAZARDS_IDB_STORE);
           const getReq = store.get('all_road_hazards');
           getReq.onsuccess = () => {
@@ -1345,8 +1369,7 @@ export async function loadRoadHazardsAsync(): Promise<RoadHazardPoint[]> {
         }
       });
       if (idbResult && idbResult.length > 0) {
-        const merged = mergeRoadHazardsWithDefaults(idbResult);
-        return merged;
+        return mergeRoadHazardsWithDefaults(idbResult);
       }
     }
   } catch {
@@ -1375,7 +1398,8 @@ export async function hydrateRoadHazardsPhotosWithToken(
             category: 'OTHER',
             categoryLabel: 'จุดเสี่ยงบนถนน',
             caption: haz.title,
-            dataUrl: haz.photoDataUrl || toRenderableImageUrl(haz.driveViewLink || ''),
+            dataUrl:
+              haz.photoDataUrl || toRenderableImageUrl(haz.driveViewLink || ''),
             driveFileId: fileId,
             driveViewLink: haz.driveViewLink,
             capturedAt: haz.reportedDate,
@@ -1401,15 +1425,16 @@ export async function hydrateRoadHazardsPhotosWithToken(
 export async function saveRoadHazardsLocally(
   hazards: RoadHazardPoint[]
 ): Promise<void> {
+  const cleaned = hazards.filter((h) => !isSyntheticPlaceholderHaz005(h));
   // 1. Save full array including base64 photos to IndexedDB (supports >50MB)
   try {
-    const db = await openHazardsIndexedDB();
-    if (db) {
+    const dbIdb = await openHazardsIndexedDB();
+    if (dbIdb) {
       await new Promise<void>((resolve) => {
         try {
-          const tx = db.transaction(ROAD_HAZARDS_IDB_STORE, 'readwrite');
+          const tx = dbIdb.transaction(ROAD_HAZARDS_IDB_STORE, 'readwrite');
           const store = tx.objectStore(ROAD_HAZARDS_IDB_STORE);
-          store.put(hazards, 'all_road_hazards');
+          store.put(cleaned, 'all_road_hazards');
           tx.oncomplete = () => resolve();
           tx.onerror = () => resolve();
         } catch {
@@ -1423,11 +1448,11 @@ export async function saveRoadHazardsLocally(
 
   // 2. Save to localStorage for instant synchronous hydration on boot
   try {
-    localStorage.setItem(ROAD_HAZARDS_STORAGE_KEY, JSON.stringify(hazards));
+    localStorage.setItem(ROAD_HAZARDS_STORAGE_KEY, JSON.stringify(cleaned));
   } catch {
     // If base64 photos exceed 5MB localStorage limit, store lightweight version in localStorage while IDB holds full photos
     try {
-      const lightweight = hazards.map((h) => ({
+      const lightweight = cleaned.map((h) => ({
         ...h,
         photoDataUrl:
           h.photoDataUrl && h.photoDataUrl.length > 120000
@@ -1444,6 +1469,271 @@ export async function saveRoadHazardsLocally(
       // Ignore quota error
     }
   }
+}
+
+// ============================================================================
+// Firebase Firestore Real-Time Cross-Origin Synchronization for Road Hazards
+// ============================================================================
+
+export enum FirestoreOperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: FirestoreOperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+function handleFirestoreError(
+  error: unknown,
+  operationType: FirestoreOperationType,
+  path: string | null
+) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo:
+        auth.currentUser?.providerData?.map((provider) => ({
+          providerId: provider.providerId,
+          email: provider.email,
+        })) || [],
+    },
+    operationType,
+    path,
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+function sanitizeRoadHazardForFirestore(
+  h: RoadHazardPoint
+): Record<string, unknown> {
+  const safeId = String(h.id || 'HAZ-001')
+    .replace(/[^a-zA-Z0-9_\-]/g, '-')
+    .slice(0, 32);
+  const payload: Record<string, unknown> = {
+    id: safeId,
+    title: String(h.title || 'จุดเสี่ยงบนถนน').slice(0, 500),
+    type: [
+      'BLIND_SPOT',
+      'BROKEN_BRIDGE',
+      'HIGH_SPEED_ZONE',
+      'POOR_LIGHTING',
+      'NO_REFUGE_ISLAND',
+    ].includes(h.type)
+      ? h.type
+      : 'BLIND_SPOT',
+    severity: h.severity === 'WARNING' ? 'WARNING' : 'CRITICAL',
+    status: ['REPORTED', 'IN_PROGRESS', 'RESOLVED'].includes(h.status)
+      ? h.status
+      : 'REPORTED',
+    lat: isNaN(Number(h.lat)) ? 8.4332 : Number(h.lat),
+    lng: isNaN(Number(h.lng)) ? 99.9661 : Number(h.lng),
+    description: String(h.description || '-').slice(0, 2000),
+    recommendedAction: String(h.recommendedAction || '-').slice(0, 2000),
+    responsibleAgency: String(h.responsibleAgency || '-').slice(0, 500),
+    reportedBy: String(h.reportedBy || 'เจ้าหน้าที่').slice(0, 300),
+    reportedDate: String(h.reportedDate || new Date().toISOString().slice(0, 10)).slice(
+      0,
+      50
+    ),
+    isPublic: true,
+  };
+
+  if (h.photoDataUrl && typeof h.photoDataUrl === 'string' && h.photoDataUrl.length <= 920000) {
+    payload.photoDataUrl = h.photoDataUrl;
+  } else if (h.driveViewLink) {
+    payload.photoDataUrl = toRenderableImageUrl(h.driveViewLink).slice(0, 920000);
+  }
+  if (h.driveFileId && typeof h.driveFileId === 'string') {
+    payload.driveFileId = h.driveFileId.slice(0, 200);
+  }
+  if (h.driveViewLink && typeof h.driveViewLink === 'string') {
+    payload.driveViewLink = h.driveViewLink.slice(0, 1000);
+  }
+
+  return payload;
+}
+
+/**
+ * Writes or updates a single RoadHazardPoint in Firebase Firestore (/road_hazards/{id})
+ * so it is immediately available across both Google AI Studio and https://senior-road-crossing-risk-gis.ai.studio
+ */
+export async function upsertRoadHazardToFirestore(
+  hazard: RoadHazardPoint
+): Promise<void> {
+  if (!hazard || !hazard.id || isSyntheticPlaceholderHaz005(hazard)) return;
+  const payload = sanitizeRoadHazardForFirestore(hazard);
+  const docId = String(payload.id);
+  const path = `road_hazards/${docId}`;
+  try {
+    await setDoc(doc(db, 'road_hazards', docId), payload);
+  } catch (error) {
+    handleFirestoreError(error, FirestoreOperationType.WRITE, path);
+  }
+}
+
+/**
+ * Deletes a RoadHazardPoint from Firebase Firestore (/road_hazards/{id})
+ */
+export async function deleteRoadHazardFromFirestore(
+  hazardId: string
+): Promise<void> {
+  if (!hazardId) return;
+  const safeId = hazardId.replace(/[^a-zA-Z0-9_\-]/g, '-').slice(0, 32);
+  const path = `road_hazards/${safeId}`;
+  try {
+    await deleteDoc(doc(db, 'road_hazards', safeId));
+  } catch (error) {
+    handleFirestoreError(error, FirestoreOperationType.DELETE, path);
+  }
+}
+
+/**
+ * Pushes any locally stored RoadHazardPoint items (such as the user's real HAZ-005 in Google AI Studio)
+ * up to Firebase Firestore so that https://senior-road-crossing-risk-gis.ai.studio immediately receives them.
+ */
+export async function syncLocalRoadHazardsToFirestore(
+  hazards: RoadHazardPoint[]
+): Promise<void> {
+  const deletedIds = getDeletedHazardIds();
+  for (const h of hazards) {
+    if (!h || !h.id || deletedIds.has(h.id) || isSyntheticPlaceholderHaz005(h)) {
+      continue;
+    }
+    try {
+      await upsertRoadHazardToFirestore(h);
+    } catch {
+      // Ignore individual sync error
+    }
+  }
+}
+
+/**
+ * Subscribes to real-time updates from Firebase Firestore (`road_hazards`),
+ * automatically merging with local IndexedDB/localStorage and backfilling any local-only hazards (like HAZ-005)
+ * up to Firestore so all app URLs display the exact same road hazards and photos!
+ */
+export function subscribeToRoadHazardsFromFirestore(
+  onUpdate: (mergedHazards: RoadHazardPoint[]) => void
+): () => void {
+  const q = query(collection(db, 'road_hazards'), where('isPublic', '==', true));
+  const unsubscribe = onSnapshot(
+    q,
+    async (snapshot) => {
+      const firestoreHazards: RoadHazardPoint[] = [];
+      const firestoreIds = new Set<string>();
+
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data() as any;
+        if (!data || !data.id) return;
+        const item: RoadHazardPoint = {
+          id: String(data.id),
+          title: String(data.title || ''),
+          type: (data.type as RoadHazardType) || 'BLIND_SPOT',
+          severity: (data.severity as RoadHazardSeverity) || 'CRITICAL',
+          status: (data.status as RoadHazardStatus) || 'REPORTED',
+          lat: Number(data.lat),
+          lng: Number(data.lng),
+          description: String(data.description || ''),
+          recommendedAction: String(data.recommendedAction || ''),
+          responsibleAgency: String(data.responsibleAgency || ''),
+          reportedBy: String(data.reportedBy || ''),
+          reportedDate: String(data.reportedDate || ''),
+          photoDataUrl: data.photoDataUrl ? String(data.photoDataUrl) : undefined,
+          driveFileId: data.driveFileId ? String(data.driveFileId) : undefined,
+          driveViewLink: data.driveViewLink ? String(data.driveViewLink) : undefined,
+        };
+        if (!isSyntheticPlaceholderHaz005(item)) {
+          firestoreHazards.push(item);
+          firestoreIds.add(item.id);
+        } else {
+          // Clean up synthetic placeholder if it ever got into Firestore
+          deleteDoc(doc(db, 'road_hazards', item.id)).catch(() => {});
+        }
+      });
+
+      const localHazards = await loadRoadHazardsAsync();
+      const deletedIds = getDeletedHazardIds();
+
+      // Check if local browser (e.g., Google AI Studio preview) has real hazards (like HAZ-005) not yet in Firestore
+      for (const loc of localHazards) {
+        if (
+          loc &&
+          loc.id &&
+          !deletedIds.has(loc.id) &&
+          !isSyntheticPlaceholderHaz005(loc)
+        ) {
+          const remoteMatch = firestoreHazards.find((f) => f.id === loc.id);
+          const localHasBetterPhoto =
+            loc.photoDataUrl &&
+            (!remoteMatch?.photoDataUrl ||
+              (loc.photoDataUrl.startsWith('data:image/jpeg') &&
+                !remoteMatch.photoDataUrl.startsWith('data:image/jpeg')));
+          if (!firestoreIds.has(loc.id) || localHasBetterPhoto) {
+            upsertRoadHazardToFirestore(loc).catch(() => {});
+          }
+        }
+      }
+
+      // Combine local + Firestore hazards (preserving full photos from either source)
+      const combinedMap = new Map<string, RoadHazardPoint>();
+      for (const h of mergeRoadHazardsWithDefaults(localHazards)) {
+        combinedMap.set(h.id, h);
+      }
+      for (const fh of firestoreHazards) {
+        if (deletedIds.has(fh.id)) continue;
+        const existing = combinedMap.get(fh.id);
+        combinedMap.set(fh.id, {
+          ...existing,
+          ...fh,
+          photoDataUrl: fh.photoDataUrl || existing?.photoDataUrl,
+          driveFileId: fh.driveFileId || existing?.driveFileId,
+          driveViewLink: fh.driveViewLink || existing?.driveViewLink,
+        });
+      }
+
+      const finalMerged = Array.from(combinedMap.values()).sort((a, b) => {
+        const numA = parseInt(a.id.replace(/\D+/g, ''), 10) || 999;
+        const numB = parseInt(b.id.replace(/\D+/g, ''), 10) || 999;
+        return numA - numB;
+      });
+
+      await saveRoadHazardsLocally(finalMerged);
+      onUpdate(finalMerged);
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, FirestoreOperationType.LIST, 'road_hazards');
+      } catch {
+        // Fallback to local storage if Firestore listener errors
+      }
+    }
+  );
+
+  return unsubscribe;
 }
 
 /**
@@ -1471,7 +1761,7 @@ export async function appendRoadHazardToGoogleSheet(
 
   let hazardTabName =
     existingSheets.find(
-      (t) => t.includes('จุดเสี่ยงบนถนน') || t.toLowerCase().includes('road hazard')
+      (t) => t.includes('จุดเสี่ยงบนถนน') || t.toLowerCase().includes('road hazard') || t.toLowerCase().includes('road_hazard')
     ) || ROAD_HAZARDS_SHEET_TAB;
 
   // If the tab doesn't exist yet, create it and populate header row
@@ -1576,8 +1866,8 @@ export async function appendRoadHazardToGoogleSheet(
 }
 
 /**
- * Fetches road hazards from the `ทะเบียนจุดเสี่ยงบนถนน` tab in Google Sheets if present,
- * hydrating any Google Drive photo links using the user's OAuth token.
+ * Fetches road hazards from the `ทะเบียนจุดเสี่ยงบนถนน` or `จุดเสี่ยงบนถนน (Road_Hazards)` tab in Google Sheets,
+ * dynamically mapping columns from the header row and hydrating any Google Drive photo links.
  */
 export async function fetchRoadHazardsFromGoogleSheet(
   accessToken: string,
@@ -1598,11 +1888,14 @@ export async function fetchRoadHazardsFromGoogleSheet(
     );
 
     const hazardTabName = existingSheets.find(
-      (t) => t.includes('จุดเสี่ยงบนถนน') || t.toLowerCase().includes('road hazard')
+      (t) =>
+        t.includes('จุดเสี่ยงบนถนน') ||
+        t.toLowerCase().includes('road hazard') ||
+        t.toLowerCase().includes('road_hazard')
     );
     if (!hazardTabName) return [];
 
-    const rangeEncoded = encodeURIComponent(`'${hazardTabName}'!A1:N300`);
+    const rangeEncoded = encodeURIComponent(`'${hazardTabName}'!A1:O300`);
     const valRes = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${safeId}/values/${rangeEncoded}`,
       {
@@ -1614,34 +1907,59 @@ export async function fetchRoadHazardsFromGoogleSheet(
     const rows: string[][] = valData.values || [];
     if (rows.length < 2) return [];
 
+    const headerRow = (rows[0] || []).map((h) => String(h || '').trim().toLowerCase());
+    const findCol = (keywords: string[], fallbackIdx: number): number => {
+      const idx = headerRow.findIndex((h) => keywords.some((kw) => h.includes(kw)));
+      return idx >= 0 ? idx : fallbackIdx;
+    };
+
+    // Detect whether col 1 is "วันที่แจ้ง" (appendRoadHazardToGoogleSheet format) or "ชื่อจุดเสี่ยง" (Excel template format)
+    const isDateSecondCol = headerRow[1]?.includes('วันที่');
+
+    const colId = findCol(['hazard_id', 'hazard id', 'รหัสจุดเสี่ยง'], 0);
+    const colTitle = findCol(['ชื่อจุดเสี่ยง', 'ตำแหน่งสังเกต'], isDateSecondCol ? 2 : 1);
+    const colType = findCol(['ประเภทจุดเสี่ยง'], isDateSecondCol ? 3 : 2);
+    const colSev = findCol(['ระดับความเร่งด่วน', 'ระดับความรุนแรง'], isDateSecondCol ? 4 : 3);
+    const colStatus = findCol(['สถานะการแก้ไข', 'สถานะ'], isDateSecondCol ? 5 : 4);
+    const colLat = findCol(['latitude', 'ละติจูด'], isDateSecondCol ? 6 : 5);
+    const colLng = findCol(['longitude', 'ลองจิจูด'], isDateSecondCol ? 7 : 6);
+    const colDesc = findCol(['รายละเอียดปัญหา', 'รายละเอียด'], isDateSecondCol ? 8 : 7);
+    const colAction = findCol(['ข้อเสนอแนะ', 'วิศวกรรม'], isDateSecondCol ? 9 : 8);
+    const colAgency = findCol(['หน่วยงานรับผิดชอบ', 'หน่วยงาน'], isDateSecondCol ? 10 : 9);
+    const colReporter = findCol(['ผู้แจ้ง'], isDateSecondCol ? 11 : 10);
+    const colDate = findCol(['วันที่แจ้ง', 'วันที่'], isDateSecondCol ? 1 : 11);
+    const colPhoto = findCol(['photo', 'ภาพถ่าย', 'รูปภาพ'], 13);
+
     const parsedHazards: RoadHazardPoint[] = [];
 
     for (let i = 1; i < rows.length; i++) {
       const r = rows[i];
       if (!r || r.length < 3) continue;
-      const id = String(r[0] || `HAZ-${String(i).padStart(3, '0')}`).trim();
-      const reportedDate = String(r[1] || '').trim() || new Date().toISOString().slice(0, 10);
-      const title = String(r[2] || '').trim();
+      const id = String(r[colId] || `HAZ-${String(i).padStart(3, '0')}`).trim();
+      const title = String(r[colTitle] || '').trim();
       if (!title) continue;
+      const reportedDate =
+        String(r[colDate] || '').trim() || new Date().toISOString().slice(0, 10);
 
-      const rawType = String(r[3] || '').toUpperCase();
-      const type: RoadHazardType = rawType.includes('BROKEN_BRIDGE') || rawType.includes('สะพาน')
-        ? 'BROKEN_BRIDGE'
-        : rawType.includes('HIGH_SPEED') || rawType.includes('ความเร็ว')
-        ? 'HIGH_SPEED_ZONE'
-        : rawType.includes('POOR_LIGHTING') || rawType.includes('อับแสง')
-        ? 'POOR_LIGHTING'
-        : rawType.includes('NO_REFUGE') || rawType.includes('เกาะกลาง')
-        ? 'NO_REFUGE_ISLAND'
-        : 'BLIND_SPOT';
+      const rawType = String(r[colType] || '').toUpperCase();
+      const type: RoadHazardType =
+        rawType.includes('BROKEN_BRIDGE') || rawType.includes('สะพาน')
+          ? 'BROKEN_BRIDGE'
+          : rawType.includes('HIGH_SPEED') || rawType.includes('ความเร็ว')
+          ? 'HIGH_SPEED_ZONE'
+          : rawType.includes('POOR_LIGHTING') || rawType.includes('อับแสง')
+          ? 'POOR_LIGHTING'
+          : rawType.includes('NO_REFUGE') || rawType.includes('เกาะกลาง')
+          ? 'NO_REFUGE_ISLAND'
+          : 'BLIND_SPOT';
 
-      const rawSev = String(r[4] || '').toUpperCase();
+      const rawSev = String(r[colSev] || '').toUpperCase();
       const severity: RoadHazardSeverity =
         rawSev.includes('WARNING') || rawSev.includes('เฝ้าระวัง')
           ? 'WARNING'
           : 'CRITICAL';
 
-      const rawStatus = String(r[5] || '').toUpperCase();
+      const rawStatus = String(r[colStatus] || '').toUpperCase();
       const status: RoadHazardStatus =
         rawStatus.includes('RESOLVED') || rawStatus.includes('เรียบร้อย')
           ? 'RESOLVED'
@@ -1649,15 +1967,16 @@ export async function fetchRoadHazardsFromGoogleSheet(
           ? 'IN_PROGRESS'
           : 'REPORTED';
 
-      const lat = Number(r[6]);
-      const lng = Number(r[7]);
+      const lat = Number(r[colLat]);
+      const lng = Number(r[colLng]);
       if (isNaN(lat) || isNaN(lng)) continue;
 
-      const description = String(r[8] || '').trim() || ROAD_HAZARD_TYPE_LABELS[type];
-      const recommendedAction = String(r[9] || '').trim();
-      const responsibleAgency = String(r[10] || '').trim();
-      const reportedBy = String(r[11] || '').trim();
-      const rawPhotoLink = String(r[13] || '').trim();
+      const description =
+        String(r[colDesc] || '').trim() || ROAD_HAZARD_TYPE_LABELS[type];
+      const recommendedAction = String(r[colAction] || '').trim();
+      const responsibleAgency = String(r[colAgency] || '').trim();
+      const reportedBy = String(r[colReporter] || '').trim();
+      const rawPhotoLink = String(r[colPhoto] || '').trim();
 
       let photoDataUrl: string | undefined = undefined;
       let driveFileId: string | undefined = undefined;
@@ -1680,13 +1999,14 @@ export async function fetchRoadHazardsFromGoogleSheet(
               capturedAt: reportedDate,
             },
           ]);
-          photoDataUrl = hydratedList[0]?.dataUrl || toRenderableImageUrl(rawPhotoLink);
+          photoDataUrl =
+            hydratedList[0]?.dataUrl || toRenderableImageUrl(rawPhotoLink);
         } else {
           photoDataUrl = toRenderableImageUrl(rawPhotoLink);
         }
       }
 
-      parsedHazards.push({
+      const item: RoadHazardPoint = {
         id,
         title,
         type,
@@ -1702,7 +2022,10 @@ export async function fetchRoadHazardsFromGoogleSheet(
         photoDataUrl,
         driveFileId,
         driveViewLink,
-      });
+      };
+      if (!isSyntheticPlaceholderHaz005(item)) {
+        parsedHazards.push(item);
+      }
     }
 
     return parsedHazards;

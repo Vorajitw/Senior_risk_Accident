@@ -1,0 +1,88 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 32 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidRoadHazard(data) {
+      return data.keys().hasAll([
+        'id',
+        'title',
+        'type',
+        'severity',
+        'status',
+        'lat',
+        'lng',
+        'description',
+        'recommendedAction',
+        'responsibleAgency',
+        'reportedBy',
+        'reportedDate',
+        'isPublic'
+      ]) &&
+      data.keys().hasOnly([
+        'id',
+        'title',
+        'type',
+        'severity',
+        'status',
+        'lat',
+        'lng',
+        'description',
+        'recommendedAction',
+        'responsibleAgency',
+        'reportedBy',
+        'reportedDate',
+        'photoDataUrl',
+        'driveFileId',
+        'driveViewLink',
+        'isPublic'
+      ]) &&
+      data.id is string && data.id.size() >= 1 && data.id.size() <= 32 && data.id.matches('^[a-zA-Z0-9_\\-]+$') &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 500 &&
+      data.type in ['BLIND_SPOT', 'BROKEN_BRIDGE', 'HIGH_SPEED_ZONE', 'POOR_LIGHTING', 'NO_REFUGE_ISLAND'] &&
+      data.severity in ['CRITICAL', 'WARNING'] &&
+      data.status in ['REPORTED', 'IN_PROGRESS', 'RESOLVED'] &&
+      data.lat is number && data.lat >= -90 && data.lat <= 90 &&
+      data.lng is number && data.lng >= -180 && data.lng <= 180 &&
+      data.description is string && data.description.size() <= 2000 &&
+      data.recommendedAction is string && data.recommendedAction.size() <= 2000 &&
+      data.responsibleAgency is string && data.responsibleAgency.size() <= 500 &&
+      data.reportedBy is string && data.reportedBy.size() <= 300 &&
+      data.reportedDate is string && data.reportedDate.size() <= 50 &&
+      data.isPublic is bool && data.isPublic == true &&
+      (!('photoDataUrl' in data) || (data.photoDataUrl is string && data.photoDataUrl.size() <= 950000)) &&
+      (!('driveFileId' in data) || (data.driveFileId is string && data.driveFileId.size() <= 200)) &&
+      (!('driveViewLink' in data) || (data.driveViewLink is string && data.driveViewLink.size() <= 1000));
+    }
+
+    match /test/connection {
+      allow get: if true;
+    }
+
+    match /road_hazards/{hazardId} {
+      allow get: if isValidId(hazardId) && existing().isPublic == true;
+      allow list: if existing().isPublic == true;
+      allow create: if isValidId(hazardId) && incoming().id == hazardId && isValidRoadHazard(incoming());
+      allow update: if isValidId(hazardId) && incoming().id == existing().id && isValidRoadHazard(incoming());
+      allow delete: if isSignedIn() && request.auth.token.email_verified == true && isValidId(hazardId);
+    }
+  }
+}

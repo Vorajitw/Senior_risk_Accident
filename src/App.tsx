@@ -25,6 +25,7 @@ import {
   googleSignIn,
   logout,
   getAccessToken,
+  testFirestoreConnection,
 } from './services/authService';
 import {
   ProvisionedFormInfo,
@@ -46,6 +47,10 @@ import {
   clearDeletedRoadHazards,
   mergeRoadHazardsWithDefaults,
   hydrateRoadHazardsPhotosWithToken,
+  upsertRoadHazardToFirestore,
+  deleteRoadHazardFromFirestore,
+  syncLocalRoadHazardsToFirestore,
+  subscribeToRoadHazardsFromFirestore,
 } from './services/workspaceService';
 import {
   downloadExcelTemplate,
@@ -330,6 +335,7 @@ export default function App() {
               );
               setRoadHazards(hydratedHazards);
               await saveRoadHazardsLocally(hydratedHazards);
+              await syncLocalRoadHazardsToFirestore(hydratedHazards);
             } catch {
               // Keep local road hazards
             }
@@ -354,15 +360,17 @@ export default function App() {
           );
           setRoadHazards(hydratedHazards);
           await saveRoadHazardsLocally(hydratedHazards);
+          await syncLocalRoadHazardsToFirestore(hydratedHazards);
         } catch {
           // Ignore hazard photo hydration error
         }
       } else {
-        // Ensure all 5 default hazards (HAZ-001 .. HAZ-005) are merged even before login
+        // Ensure local hazards are merged and pushed to shared Cloud Firestore
         const localHazards = await loadRoadHazardsAsync();
         const merged = mergeRoadHazardsWithDefaults(localHazards);
         setRoadHazards(merged);
         await saveRoadHazardsLocally(merged);
+        await syncLocalRoadHazardsToFirestore(merged);
       }
 
       setRecords(combinedRecords);
@@ -404,17 +412,24 @@ export default function App() {
     }
   };
 
-  // Load attached Google Sheets dataset & persisted Road Hazards automatically on mount, and listen for Google Auth state
+  // Load attached Google Sheets dataset & persisted Road Hazards automatically on mount, sync with Cloud Firestore, and listen for Google Auth state
   useEffect(() => {
+    testFirestoreConnection();
+
     loadRoadHazardsAsync().then((savedHazards) => {
       if (savedHazards && savedHazards.length > 0) {
         setRoadHazards(savedHazards);
+        syncLocalRoadHazardsToFirestore(savedHazards);
       }
+    });
+
+    const unsubscribeHazards = subscribeToRoadHazardsFromFirestore((merged) => {
+      setRoadHazards(merged);
     });
 
     runAutoSyncDatabase(null, null);
 
-    const unsubscribe = initAuth(
+    const unsubscribeAuth = initAuth(
       (authedUser, token) => {
         setUser(authedUser);
         runAutoSyncDatabase(token, authedUser.email);
@@ -423,7 +438,10 @@ export default function App() {
         setUser(null);
       }
     );
-    return () => unsubscribe();
+    return () => {
+      unsubscribeHazards();
+      unsubscribeAuth();
+    };
   }, []);
 
   const handleGoogleLogin = async () => {
@@ -824,27 +842,36 @@ export default function App() {
       saveRoadHazardsLocally(next);
       return next;
     });
+    deleteRoadHazardFromFirestore(hazardId);
     if (selectedHazardId === hazardId) {
       setSelectedHazardId(null);
     }
     showToast(
       'ลบหมุดจุดเสี่ยงสำเร็จ',
-      `ลบหมุดจุดเสี่ยง "${target?.title || hazardId}" ออกจากแผนที่และฐานข้อมูลเรียบร้อยแล้ว`,
+      `ลบหมุดจุดเสี่ยง "${target?.title || hazardId}" ออกจากแผนที่และฐานข้อมูล Cloud เรียบร้อยแล้ว`,
       'INFO'
     );
   };
 
   const handleRestoreAllRoadHazards = async () => {
     clearDeletedRoadHazards();
-    const restored = mergeRoadHazardsWithDefaults(roadHazards);
+    const localStored = await loadRoadHazardsAsync();
+    const restored = mergeRoadHazardsWithDefaults([
+      ...localStored,
+      ...roadHazards,
+    ]);
     setRoadHazards(restored);
     await saveRoadHazardsLocally(restored);
-    setSelectedHazardId('HAZ-005');
-    setSelectedRecordId(null);
+    await syncLocalRoadHazardsToFirestore(restored);
+    const haz005 = restored.find((h) => h.id === 'HAZ-005');
+    if (haz005) {
+      setSelectedHazardId('HAZ-005');
+      setSelectedRecordId(null);
+    }
     setShowRoadHazardsLayer(true);
     showToast(
       'บันทึกสำเร็จ',
-      `ซิงก์และแสดงผลทะเบียนจุดเสี่ยงบนถนนครบทั้ง ${restored.length} จุด (รวมรหัส HAZ-005) เรียบร้อยแล้ว`,
+      `ซิงก์ข้อมูลจุดเสี่ยงบนถนนผ่านฐานข้อมูล Cloud (Firestore) ครบทั้ง ${restored.length} จุด เรียบร้อยแล้ว`,
       'SUCCESS'
     );
   };
@@ -895,13 +922,20 @@ export default function App() {
     status: RoadHazardStatus
   ) => {
     setRoadHazards((prev) => {
-      const next = prev.map((h) => (h.id === hazardId ? { ...h, status } : h));
+      const next = prev.map((h) => {
+        if (h.id === hazardId) {
+          const updated = { ...h, status };
+          upsertRoadHazardToFirestore(updated);
+          return updated;
+        }
+        return h;
+      });
       saveRoadHazardsLocally(next);
       return next;
     });
     showToast(
       'บันทึกสำเร็จ',
-      `อัปเดตสถานะหมุดจุดเสี่ยง ${hazardId} เป็น "${ROAD_HAZARD_STATUS_LABELS[status]}" เรียบร้อยแล้ว`,
+      `อัปเดตสถานะหมุดจุดเสี่ยง ${hazardId} เป็น "${ROAD_HAZARD_STATUS_LABELS[status]}" และซิงก์ขึ้น Cloud เรียบร้อยแล้ว`,
       'SUCCESS'
     );
   };
@@ -1032,10 +1066,15 @@ export default function App() {
         driveViewLink,
       };
 
-      // Update React State and persist immediately to localStorage + IndexedDB
+      // Update React State and persist immediately to localStorage + IndexedDB + Cloud Firestore
       const nextList = [created, ...roadHazards];
       setRoadHazards(nextList);
       await saveRoadHazardsLocally(nextList);
+
+      setSavingHazardStep(
+        'กำลังซิงก์พิกัดและรูปภาพขึ้นฐานข้อมูล Cloud (Firestore) เพื่อให้แสดงผลตรงกันทุก URL...'
+      );
+      await upsertRoadHazardToFirestore(created);
 
       // If connected to a Google Sheet and signed in, append to the Road Hazards sheet tab
       if (user && provisionedSheet?.spreadsheetId) {
@@ -1879,20 +1918,22 @@ export default function App() {
                   <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-bold text-slate-900">
-                        ทะเบียนจุดเสี่ยงบนถนนในชุมชน ({roadHazards.length} จุด · รหัส HAZ-001 ถึง {roadHazards[roadHazards.length - 1]?.id || 'HAZ-005'}) · คลิกเพื่อดูตำแหน่งบนแผนที่:
+                        ทะเบียนจุดเสี่ยงบนถนนในชุมชน ({roadHazards.length} จุด) · คลิกเพื่อดูตำแหน่งบนแผนที่:
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSelectedHazardId('HAZ-005');
-                          setSelectedRecordId(null);
-                          setShowRoadHazardsLayer(true);
-                        }}
-                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 text-red-700 border border-red-200 font-semibold hover:bg-red-100 cursor-pointer"
-                      >
-                        <MapPin className="w-3 h-3 text-red-600" />
-                        <span>ดูจุดเสี่ยง HAZ-005 บนแผนที่</span>
-                      </button>
+                      {roadHazards.some((h) => h.id === 'HAZ-005') && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedHazardId('HAZ-005');
+                            setSelectedRecordId(null);
+                            setShowRoadHazardsLayer(true);
+                          }}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 text-red-700 border border-red-200 font-semibold hover:bg-red-100 cursor-pointer"
+                        >
+                          <MapPin className="w-3 h-3 text-red-600" />
+                          <span>ดูจุดเสี่ยง HAZ-005 บนแผนที่</span>
+                        </button>
+                      )}
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-slate-500">
@@ -1911,10 +1952,10 @@ export default function App() {
                         type="button"
                         onClick={handleRestoreAllRoadHazards}
                         className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300 text-[11px] font-semibold cursor-pointer"
-                        title="ซิงก์และกู้คืนหมุดจุดเสี่ยงมาตรฐานให้ครบทั้ง 5 จุด (HAZ-001 ถึง HAZ-005)"
+                        title="ซิงก์ข้อมูลจุดเสี่ยงจริงจาก Google AI Studio / Google Sheets ผ่าน Cloud Firestore"
                       >
                         <RefreshCw className="w-3 h-3" />
-                        <span>ซิงก์ครบ 5 จุด</span>
+                        <span>ซิงก์ข้อมูลจุดเสี่ยง Cloud (Firestore)</span>
                       </button>
                     </div>
                   </div>

@@ -1614,31 +1614,8 @@ export const INITIAL_ROAD_HAZARDS: RoadHazardPoint[] = [
       '#16a34a'
     ),
   },
-  {
-    id: 'HAZ-005',
-    title: 'จุดเสี่ยงทางข้ามถนน 4 เลนหน้าชุมชนบ้านชะเมา หมู่ 6 (ไม่มีเกาะกลางพักรอ 2 จังหวะ)',
-    type: 'NO_REFUGE_ISLAND',
-    severity: 'CRITICAL',
-    status: 'REPORTED',
-    lat: 8.2493,
-    lng: 100.0138,
-    description:
-      'จุดข้ามถนนของกลุ่มผู้สูงอายุหมู่ 6 บ้านชะเมา (เช่น นายทรงศักดิ์ ยุทธชัย ที่ต้องใช้ไม้เท้าช่วยเดิน) ไม่มีเกาะกลางพักรอและมีไหล่ทางต่างระดับ เสี่ยงต่อการติดค้างกลางถนน 4 เลน',
-    recommendedAction:
-      'จัดทำทางลาดเชื่อมต่อสะพานข้ามร่องกลางสำหรับผู้สูงอายุที่ใช้ไม้เท้า ติดตั้งป้ายไฟกะพริบเตือนลดความเร็ว และจัดอาสาสมัครเพื่อนช่วยพาข้าม (Pedestrian Companion)',
-    responsibleAgency: 'กองช่าง อบต./เทศบาล และหมวดทางหลวง',
-    reportedBy: 'นางพวงรัตน์ พรหมทอง (อสม. หมู่ 6 บ้านชะเมา)',
-    reportedDate: '2026-11-08',
-    driveFileId: '1aDgm76rBJRq50JfgrOTKQctgKISm5WHM',
-    driveViewLink:
-      'https://drive.google.com/file/d/1aDgm76rBJRq50JfgrOTKQctgKISm5WHM/view?usp=drivesdk',
-    photoDataUrl: createFieldHazardSvgDataUrl(
-      'HAZ-005: จุดเสี่ยงทางข้ามถนน 4 เลน หมู่ 6 บ้านชะเมา',
-      'ผู้สูงอายุใช้ไม้เท้าช่วยเดิน ขาดจุดพักรอ 2 จังหวะและทางลาดไหล่ทาง',
-      '#dc2626'
-    ),
-  },
 ];
+
 
 
 

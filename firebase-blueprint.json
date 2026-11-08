@@ -1,0 +1,116 @@
+{
+  "entities": {
+    "RoadHazard": {
+      "title": "RoadHazard",
+      "description": "Community road crossing hazard point with GPS coordinates and field photo",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique hazard ID such as HAZ-001 or HAZ-005",
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Title or landmark name of the road hazard",
+          "maxLength": 500
+        },
+        "type": {
+          "type": "string",
+          "description": "Category of the road hazard",
+          "enum": [
+            "BLIND_SPOT",
+            "BROKEN_BRIDGE",
+            "HIGH_SPEED_ZONE",
+            "POOR_LIGHTING",
+            "NO_REFUGE_ISLAND"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "description": "Urgency level of the hazard",
+          "enum": ["CRITICAL", "WARNING"]
+        },
+        "status": {
+          "type": "string",
+          "description": "Resolution status of the hazard",
+          "enum": ["REPORTED", "IN_PROGRESS", "RESOLVED"]
+        },
+        "lat": {
+          "type": "number",
+          "description": "Latitude coordinate"
+        },
+        "lng": {
+          "type": "number",
+          "description": "Longitude coordinate"
+        },
+        "description": {
+          "type": "string",
+          "description": "Detailed description of the road hazard",
+          "maxLength": 2000
+        },
+        "recommendedAction": {
+          "type": "string",
+          "description": "Recommended engineering or community intervention",
+          "maxLength": 2000
+        },
+        "responsibleAgency": {
+          "type": "string",
+          "description": "Agency responsible for fixing the hazard",
+          "maxLength": 500
+        },
+        "reportedBy": {
+          "type": "string",
+          "description": "Name or role of the person who reported the hazard",
+          "maxLength": 300
+        },
+        "reportedDate": {
+          "type": "string",
+          "description": "ISO date when the hazard was reported",
+          "maxLength": 50
+        },
+        "photoDataUrl": {
+          "type": "string",
+          "description": "Base64 JPEG/SVG data URL or renderable URL of the hazard photo",
+          "maxLength": 950000
+        },
+        "driveFileId": {
+          "type": "string",
+          "description": "Optional Google Drive file ID for the uploaded photo",
+          "maxLength": 200
+        },
+        "driveViewLink": {
+          "type": "string",
+          "description": "Optional Google Drive view link for the uploaded photo",
+          "maxLength": 1000
+        },
+        "isPublic": {
+          "type": "boolean",
+          "description": "Whether this hazard record is publicly visible on the community GIS map"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "type",
+        "severity",
+        "status",
+        "lat",
+        "lng",
+        "description",
+        "recommendedAction",
+        "responsibleAgency",
+        "reportedBy",
+        "reportedDate",
+        "isPublic"
+      ]
+    }
+  },
+  "firestore": {
+    "/road_hazards/{hazardId}": {
+      "schema": { "$ref": "#/entities/RoadHazard" },
+      "description": "Publicly readable community road hazard points synced across all app URLs"
+    }
+  }
+}
