@@ -1,0 +1,6 @@
+{
+  "name": "ระบบคัดกรองและประเมินความเสี่ยงการข้ามถนนของผู้สูงอายุ (Senior Road Crossing Risk & GIS)",
+  "description": "แพลตฟอร์มสร้างและจัดการแบบฟอร์มคัดกรองความเสี่ยงการข้ามถนนของผู้สูงอายุ 5 ส่วน 6 มิติ เชื่อมต่อ Google Forms, Google Sheets, Google Drive และแผนที่พิกัด GIS ชุมชน",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

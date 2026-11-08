@@ -1,0 +1,6 @@
+{
+  "summary": "แผนการพัฒนาเว็บแอปพลิเคชันระบบคัดกรองและประเมินความเสี่ยงการข้ามถนนของผู้สูงอายุ (Senior Pedestrian Crossing Risk Assessment System) ที่เชื่อมต่อกับ Google Forms API, Google Sheets API, Google Drive API และ Google Maps Platform แบบครบวงจร พร้อมการสร้างฟอร์ม 5 ส่วนอัตโนมัติ การคำนวณคะแนนความเสี่ยง 6 มิติ (เขียว-เหลือง-แดง) การดาวน์โหลดไฟล์แม่แบบ .xlsx และการส่งออกพิกัด KML/CSV สำหรับ Google My Maps",
+  "updatedAt": "2026-11-05T09:33:03.056767993Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
