@@ -1200,9 +1200,85 @@ export async function findAndConnectUserGoogleSheet(
 // ============================================================================
 
 const ROAD_HAZARDS_STORAGE_KEY = 'senior_risk_road_hazards_v1';
+const ROAD_HAZARDS_DELETED_KEY = 'senior_risk_deleted_road_hazards_v1';
 const ROAD_HAZARDS_IDB_NAME = 'senior_risk_gis_storage_v1';
 const ROAD_HAZARDS_IDB_STORE = 'road_hazards_store';
 const ROAD_HAZARDS_SHEET_TAB = 'ทะเบียนจุดเสี่ยงบนถนน (Road Hazards)';
+
+function getDeletedHazardIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(ROAD_HAZARDS_DELETED_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return new Set(parsed.map(String));
+      }
+    }
+  } catch {
+    // Ignore
+  }
+  return new Set();
+}
+
+export function markRoadHazardDeleted(hazardId: string): void {
+  try {
+    const deleted = getDeletedHazardIds();
+    deleted.add(hazardId);
+    localStorage.setItem(
+      ROAD_HAZARDS_DELETED_KEY,
+      JSON.stringify(Array.from(deleted))
+    );
+  } catch {
+    // Ignore
+  }
+}
+
+export function clearDeletedRoadHazards(): void {
+  try {
+    localStorage.removeItem(ROAD_HAZARDS_DELETED_KEY);
+  } catch {
+    // Ignore
+  }
+}
+
+/**
+ * Merges INITIAL_ROAD_HAZARDS (HAZ-001 .. HAZ-005) with any stored/custom hazards so
+ * all 5 core hazards (including HAZ-005) are always present even if an older browser cache only had 4 items.
+ */
+export function mergeRoadHazardsWithDefaults(
+  stored: RoadHazardPoint[]
+): RoadHazardPoint[] {
+  const deletedIds = getDeletedHazardIds();
+  const byId = new Map<string, RoadHazardPoint>();
+
+  // 1. Seed all core INITIAL_ROAD_HAZARDS (HAZ-001 to HAZ-005) unless explicitly deleted
+  for (const initHaz of INITIAL_ROAD_HAZARDS) {
+    if (!deletedIds.has(initHaz.id)) {
+      byId.set(initHaz.id, initHaz);
+    }
+  }
+
+  // 2. Overlay stored/user-created hazards (user edits or custom HAZ-005/HAZ-006 take priority)
+  for (const item of stored) {
+    if (!item || !item.id) continue;
+    if (deletedIds.has(item.id)) continue;
+    const base = byId.get(item.id);
+    byId.set(item.id, {
+      ...base,
+      ...item,
+      photoDataUrl: item.photoDataUrl || base?.photoDataUrl,
+      driveFileId: item.driveFileId || base?.driveFileId,
+      driveViewLink: item.driveViewLink || base?.driveViewLink,
+    });
+  }
+
+  // Sort by HAZ-xxx number ascending so HAZ-001, HAZ-002, HAZ-003, HAZ-004, HAZ-005 appear in clear order
+  return Array.from(byId.values()).sort((a, b) => {
+    const numA = parseInt(a.id.replace(/\D+/g, ''), 10) || 999;
+    const numB = parseInt(b.id.replace(/\D+/g, ''), 10) || 999;
+    return numA - numB;
+  });
+}
 
 function openHazardsIndexedDB(): Promise<IDBDatabase | null> {
   if (typeof window === 'undefined' || !window.indexedDB) {
@@ -1226,7 +1302,7 @@ function openHazardsIndexedDB(): Promise<IDBDatabase | null> {
 }
 
 /**
- * Synchronously loads initial road hazards from localStorage (falling back to INITIAL_ROAD_HAZARDS)
+ * Synchronously loads initial road hazards from localStorage merged with INITIAL_ROAD_HAZARDS (HAZ-001 to HAZ-005)
  */
 export function loadRoadHazardsSync(): RoadHazardPoint[] {
   try {
@@ -1234,17 +1310,18 @@ export function loadRoadHazardsSync(): RoadHazardPoint[] {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return parsed;
+        return mergeRoadHazardsWithDefaults(parsed);
       }
     }
   } catch {
     // Fallback to INITIAL_ROAD_HAZARDS
   }
-  return INITIAL_ROAD_HAZARDS;
+  return mergeRoadHazardsWithDefaults([]);
 }
 
 /**
- * Asynchronously loads full road hazards (including full high-res base64 photos) from IndexedDB or localStorage
+ * Asynchronously loads full road hazards (including full high-res base64 photos) from IndexedDB or localStorage,
+ * always ensuring HAZ-001 through HAZ-005 are present.
  */
 export async function loadRoadHazardsAsync(): Promise<RoadHazardPoint[]> {
   try {
@@ -1268,13 +1345,54 @@ export async function loadRoadHazardsAsync(): Promise<RoadHazardPoint[]> {
         }
       });
       if (idbResult && idbResult.length > 0) {
-        return idbResult;
+        const merged = mergeRoadHazardsWithDefaults(idbResult);
+        return merged;
       }
     }
   } catch {
     // Fallback to localStorage
   }
   return loadRoadHazardsSync();
+}
+
+/**
+ * Hydrates Google Drive photos on RoadHazardPoint items when the user signs in with Google
+ */
+export async function hydrateRoadHazardsPhotosWithToken(
+  accessToken: string,
+  hazards: RoadHazardPoint[]
+): Promise<RoadHazardPoint[]> {
+  return Promise.all(
+    hazards.map(async (haz) => {
+      const fileId =
+        haz.driveFileId ||
+        (haz.driveViewLink ? extractDriveFileId(haz.driveViewLink) : null);
+      if (!fileId) return haz;
+      try {
+        const hydratedList = await hydrateDrivePhotosWithToken(accessToken, [
+          {
+            id: `haz-photo-${haz.id}`,
+            category: 'OTHER',
+            categoryLabel: 'จุดเสี่ยงบนถนน',
+            caption: haz.title,
+            dataUrl: haz.photoDataUrl || toRenderableImageUrl(haz.driveViewLink || ''),
+            driveFileId: fileId,
+            driveViewLink: haz.driveViewLink,
+            capturedAt: haz.reportedDate,
+          },
+        ]);
+        if (hydratedList[0]?.dataUrl) {
+          return {
+            ...haz,
+            photoDataUrl: hydratedList[0].dataUrl,
+          };
+        }
+      } catch {
+        // Keep existing photoDataUrl
+      }
+      return haz;
+    })
+  );
 }
 
 /**

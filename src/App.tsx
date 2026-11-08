@@ -42,6 +42,10 @@ import {
   saveRoadHazardsLocally,
   appendRoadHazardToGoogleSheet,
   fetchRoadHazardsFromGoogleSheet,
+  markRoadHazardDeleted,
+  clearDeletedRoadHazards,
+  mergeRoadHazardsWithDefaults,
+  hydrateRoadHazardsPhotosWithToken,
 } from './services/workspaceService';
 import {
   downloadExcelTemplate,
@@ -300,30 +304,32 @@ export default function App() {
               ]);
             }
 
-            // Also sync road hazards from Google Sheet if present, merging with locally saved hazards
+            // Also sync road hazards from Google Sheet if present, merging with locally saved hazards and INITIAL_ROAD_HAZARDS (HAZ-001..HAZ-005)
             try {
+              const localStoredHazards = await loadRoadHazardsAsync();
               const sheetHazards = await fetchRoadHazardsFromGoogleSheet(
                 accessToken,
                 discoveredSheet.spreadsheetId
               );
-              if (sheetHazards.length > 0) {
-                const localStoredHazards = await loadRoadHazardsAsync();
-                const mergedMap = new Map<string, RoadHazardPoint>();
-                for (const h of localStoredHazards) {
-                  mergedMap.set(h.id, h);
-                }
-                for (const sh of sheetHazards) {
-                  const existingLocal = mergedMap.get(sh.id);
-                  mergedMap.set(sh.id, {
-                    ...sh,
-                    photoDataUrl:
-                      sh.photoDataUrl || existingLocal?.photoDataUrl,
-                  });
-                }
-                const mergedHazards = Array.from(mergedMap.values());
-                setRoadHazards(mergedHazards);
-                await saveRoadHazardsLocally(mergedHazards);
+              const mergedMap = new Map<string, RoadHazardPoint>();
+              for (const h of mergeRoadHazardsWithDefaults(localStoredHazards)) {
+                mergedMap.set(h.id, h);
               }
+              for (const sh of sheetHazards) {
+                const existingLocal = mergedMap.get(sh.id);
+                mergedMap.set(sh.id, {
+                  ...existingLocal,
+                  ...sh,
+                  photoDataUrl:
+                    sh.photoDataUrl || existingLocal?.photoDataUrl,
+                });
+              }
+              const hydratedHazards = await hydrateRoadHazardsPhotosWithToken(
+                accessToken,
+                Array.from(mergedMap.values())
+              );
+              setRoadHazards(hydratedHazards);
+              await saveRoadHazardsLocally(hydratedHazards);
             } catch {
               // Keep local road hazards
             }
@@ -335,11 +341,28 @@ export default function App() {
           }
         }
 
-        // Hydrate Google Drive photo links (e.g., SNR-0614 นายทรงศักดิ์ ยุทธชัย) using the user's OAuth token
+        // Hydrate Google Drive photo links (e.g., SNR-0614 นายทรงศักดิ์ ยุทธชัย and HAZ-005) using the user's OAuth token
         combinedRecords = await hydrateRecordsPhotosWithToken(
           accessToken,
           combinedRecords
         );
+        try {
+          const currentHazards = await loadRoadHazardsAsync();
+          const hydratedHazards = await hydrateRoadHazardsPhotosWithToken(
+            accessToken,
+            currentHazards
+          );
+          setRoadHazards(hydratedHazards);
+          await saveRoadHazardsLocally(hydratedHazards);
+        } catch {
+          // Ignore hazard photo hydration error
+        }
+      } else {
+        // Ensure all 5 default hazards (HAZ-001 .. HAZ-005) are merged even before login
+        const localHazards = await loadRoadHazardsAsync();
+        const merged = mergeRoadHazardsWithDefaults(localHazards);
+        setRoadHazards(merged);
+        await saveRoadHazardsLocally(merged);
       }
 
       setRecords(combinedRecords);
@@ -795,6 +818,7 @@ export default function App() {
 
   const handleDeleteRoadHazard = (hazardId: string) => {
     const target = roadHazards.find((h) => h.id === hazardId);
+    markRoadHazardDeleted(hazardId);
     setRoadHazards((prev) => {
       const next = prev.filter((h) => h.id !== hazardId);
       saveRoadHazardsLocally(next);
@@ -807,6 +831,21 @@ export default function App() {
       'ลบหมุดจุดเสี่ยงสำเร็จ',
       `ลบหมุดจุดเสี่ยง "${target?.title || hazardId}" ออกจากแผนที่และฐานข้อมูลเรียบร้อยแล้ว`,
       'INFO'
+    );
+  };
+
+  const handleRestoreAllRoadHazards = async () => {
+    clearDeletedRoadHazards();
+    const restored = mergeRoadHazardsWithDefaults(roadHazards);
+    setRoadHazards(restored);
+    await saveRoadHazardsLocally(restored);
+    setSelectedHazardId('HAZ-005');
+    setSelectedRecordId(null);
+    setShowRoadHazardsLayer(true);
+    showToast(
+      'บันทึกสำเร็จ',
+      `ซิงก์และแสดงผลทะเบียนจุดเสี่ยงบนถนนครบทั้ง ${restored.length} จุด (รวมรหัส HAZ-005) เรียบร้อยแล้ว`,
+      'SUCCESS'
     );
   };
 
@@ -1836,29 +1875,55 @@ export default function App() {
 
               {/* Compact Road Hazard Registry Strip */}
               {showRoadHazardsLayer && roadHazards.length > 0 && (
-                <div className="pt-2 space-y-2">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-bold text-slate-800">
-                      ทะเบียนจุดเสี่ยงบนถนนในชุมชน ({roadHazards.length} จุด) · คลิกเพื่อดูตำแหน่งบนแผนที่:
-                    </span>
-                    <span className="text-slate-500">
-                      วิกฤต{' '}
-                      {
-                        roadHazards.filter(
-                          (h) =>
-                            h.severity === 'CRITICAL' && h.status !== 'RESOLVED'
-                        ).length
-                      }{' '}
-                      จุด · แก้ไขแล้ว{' '}
-                      {roadHazards.filter((h) => h.status === 'RESOLVED').length}{' '}
-                      จุด
-                    </span>
+                <div className="pt-2 space-y-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-bold text-slate-900">
+                        ทะเบียนจุดเสี่ยงบนถนนในชุมชน ({roadHazards.length} จุด · รหัส HAZ-001 ถึง {roadHazards[roadHazards.length - 1]?.id || 'HAZ-005'}) · คลิกเพื่อดูตำแหน่งบนแผนที่:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedHazardId('HAZ-005');
+                          setSelectedRecordId(null);
+                          setShowRoadHazardsLayer(true);
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-50 text-red-700 border border-red-200 font-semibold hover:bg-red-100 cursor-pointer"
+                      >
+                        <MapPin className="w-3 h-3 text-red-600" />
+                        <span>ดูจุดเสี่ยง HAZ-005 บนแผนที่</span>
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-slate-500">
+                        วิกฤต{' '}
+                        {
+                          roadHazards.filter(
+                            (h) =>
+                              h.severity === 'CRITICAL' && h.status !== 'RESOLVED'
+                          ).length
+                        }{' '}
+                        จุด · แก้ไขแล้ว{' '}
+                        {roadHazards.filter((h) => h.status === 'RESOLVED').length}{' '}
+                        จุด
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleRestoreAllRoadHazards}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300 text-[11px] font-semibold cursor-pointer"
+                        title="ซิงก์และกู้คืนหมุดจุดเสี่ยงมาตรฐานให้ครบทั้ง 5 จุด (HAZ-001 ถึง HAZ-005)"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>ซิงก์ครบ 5 จุด</span>
+                      </button>
+                    </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-2.5 text-xs">
                     {roadHazards.map((haz) => {
                       const isSelected = selectedHazardId === haz.id;
                       const isResolved = haz.status === 'RESOLVED';
+                      const isHaz005 = haz.id === 'HAZ-005';
                       return (
                         <div
                           key={haz.id}
@@ -1866,17 +1931,19 @@ export default function App() {
                             setSelectedHazardId(haz.id);
                             setSelectedRecordId(null);
                           }}
-                          className={`p-3 rounded-lg border cursor-pointer transition-colors space-y-1 ${
+                          className={`p-3 rounded-lg border cursor-pointer transition-all space-y-1.5 ${
                             isSelected
-                              ? 'border-blue-600 bg-blue-50/50'
+                              ? 'border-blue-600 bg-blue-50/60 ring-2 ring-blue-500/20 shadow-xs'
+                              : isHaz005
+                              ? 'border-red-300 bg-red-50/25 hover:bg-red-50/50'
                               : 'border-slate-200 bg-slate-50/70 hover:bg-slate-100/80'
                           }`}
                         >
                           <div className="flex items-center justify-between gap-2">
-                            <span className="font-mono font-bold text-[11px] text-slate-700">
+                            <span className="font-mono font-bold text-[11px] text-slate-800 bg-white px-1.5 py-0.5 rounded border border-slate-200">
                               {haz.id}
                             </span>
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex items-center gap-1">
                               <span
                                 className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
                                   isResolved
@@ -1912,14 +1979,17 @@ export default function App() {
                               />
                             </div>
                           )}
-                          <div className="font-bold text-slate-900 line-clamp-1">
+                          <div className="font-bold text-slate-900 line-clamp-2 leading-snug">
                             {haz.title}
                           </div>
                           <div className="text-[11px] text-slate-600 line-clamp-1">
                             {ROAD_HAZARD_TYPE_LABELS[haz.type]}
                           </div>
-                          <div className="text-[11px] text-slate-500 font-mono tabular-nums">
-                            พิกัด: {haz.lat.toFixed(5)}, {haz.lng.toFixed(5)}
+                          <div className="text-[11px] text-slate-500 font-mono tabular-nums flex items-center justify-between pt-0.5">
+                            <span>พิกัด: {haz.lat.toFixed(4)}, {haz.lng.toFixed(4)}</span>
+                            <span className="text-[10px] text-blue-700 font-sans font-semibold">
+                              ดูบนแผนที่ →
+                            </span>
                           </div>
                         </div>
                       );
