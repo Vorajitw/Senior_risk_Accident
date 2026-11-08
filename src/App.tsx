@@ -37,6 +37,11 @@ import {
   uploadHazardPhotoToDrive,
   hydrateRecordsPhotosWithToken,
   findAndConnectUserGoogleSheet,
+  loadRoadHazardsSync,
+  loadRoadHazardsAsync,
+  saveRoadHazardsLocally,
+  appendRoadHazardToGoogleSheet,
+  fetchRoadHazardsFromGoogleSheet,
 } from './services/workspaceService';
 import {
   downloadExcelTemplate,
@@ -50,7 +55,9 @@ import { AssessmentFormWizard } from './components/AssessmentFormWizard';
 import { WorkspaceManager } from './components/WorkspaceManager';
 import { ManualGuideView } from './components/ManualGuideView';
 import { SeniorSummaryCardModal } from './components/SeniorSummaryCardModal';
+import { FullAssessmentResponseModal } from './components/FullAssessmentResponseModal';
 import { RiskDistributionChart } from './components/RiskDistributionChart';
+import { RiskTrendLineChart } from './components/RiskTrendLineChart';
 import {
   Download,
   ExternalLink,
@@ -75,6 +82,8 @@ import {
   KeyRound,
   ShieldCheck,
   ShieldAlert,
+  Loader2,
+  X,
 } from 'lucide-react';
 
 type ActiveTab = 'DASHBOARD' | 'FORM' | 'WORKSPACE' | 'GUIDE';
@@ -86,13 +95,16 @@ export default function App() {
     INITIAL_RECORDS[0]?.id || null
   );
 
-  // Road Hazard Layer state
-  const [roadHazards, setRoadHazards] =
-    useState<RoadHazardPoint[]>(INITIAL_ROAD_HAZARDS);
+  // Road Hazard Layer state (persisted in localStorage + IndexedDB + Google Sheets)
+  const [roadHazards, setRoadHazards] = useState<RoadHazardPoint[]>(() =>
+    loadRoadHazardsSync()
+  );
   const [showSeniorHomesLayer, setShowSeniorHomesLayer] = useState(true);
   const [showRoadHazardsLayer, setShowRoadHazardsLayer] = useState(true);
   const [selectedHazardId, setSelectedHazardId] = useState<string | null>(null);
   const [isAddingHazard, setIsAddingHazard] = useState(false);
+  const [isSavingHazard, setIsSavingHazard] = useState(false);
+  const [savingHazardStep, setSavingHazardStep] = useState<string>('');
   const [newHazardTitle, setNewHazardTitle] = useState('');
   const [newHazardType, setNewHazardType] =
     useState<RoadHazardType>('BLIND_SPOT');
@@ -109,17 +121,39 @@ export default function App() {
     undefined
   );
 
+  // Toast Notification state
+  const [toastNotification, setToastNotification] = useState<{
+    id: number;
+    title: string;
+    message: string;
+    variant: 'SUCCESS' | 'INFO';
+  } | null>(null);
+
+  const showToast = (
+    title: string,
+    message: string,
+    variant: 'SUCCESS' | 'INFO' = 'SUCCESS'
+  ) => {
+    const toastId = Date.now();
+    setToastNotification({ id: toastId, title, message, variant });
+    window.setTimeout(() => {
+      setToastNotification((prev) => (prev?.id === toastId ? null : prev));
+    }, 5000);
+  };
+
   // Filtering & Search state for the Responses table
   const [riskFilter, setRiskFilter] = useState<'ALL' | RiskLevelCode>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [printingRecord, setPrintingRecord] =
+    useState<AssessmentRecord | null>(null);
+  const [viewingFullRecord, setViewingFullRecord] =
     useState<AssessmentRecord | null>(null);
   const [editingRecord, setEditingRecord] =
     useState<AssessmentRecord | null>(null);
   const [deletingRecord, setDeletingRecord] =
     useState<AssessmentRecord | null>(null);
 
-  // Email Auth Gate for Edit/Delete/Workspace/Guide/Excel actions
+  // Email Auth Gate for Edit/Delete/Workspace/Guide/Excel/FullResponse actions
   const [authRequiredPrompt, setAuthRequiredPrompt] = useState<{
     isOpen: boolean;
     actionType:
@@ -128,7 +162,8 @@ export default function App() {
       | 'DELETE_HAZARD'
       | 'WORKSPACE_ACCESS'
       | 'GUIDE_ACCESS'
-      | 'DOWNLOAD_EXCEL';
+      | 'DOWNLOAD_EXCEL'
+      | 'VIEW_FULL_RESPONSE';
     targetRecord?: AssessmentRecord;
     targetHazardId?: string;
     targetHazardTitle?: string;
@@ -264,6 +299,34 @@ export default function App() {
                 ...combinedRecords,
               ]);
             }
+
+            // Also sync road hazards from Google Sheet if present, merging with locally saved hazards
+            try {
+              const sheetHazards = await fetchRoadHazardsFromGoogleSheet(
+                accessToken,
+                discoveredSheet.spreadsheetId
+              );
+              if (sheetHazards.length > 0) {
+                const localStoredHazards = await loadRoadHazardsAsync();
+                const mergedMap = new Map<string, RoadHazardPoint>();
+                for (const h of localStoredHazards) {
+                  mergedMap.set(h.id, h);
+                }
+                for (const sh of sheetHazards) {
+                  const existingLocal = mergedMap.get(sh.id);
+                  mergedMap.set(sh.id, {
+                    ...sh,
+                    photoDataUrl:
+                      sh.photoDataUrl || existingLocal?.photoDataUrl,
+                  });
+                }
+                const mergedHazards = Array.from(mergedMap.values());
+                setRoadHazards(mergedHazards);
+                await saveRoadHazardsLocally(mergedHazards);
+              }
+            } catch {
+              // Keep local road hazards
+            }
           } catch (sheetErr) {
             console.warn(
               'Auto-sync from live Google Sheet encountered an issue, using attached dataset:',
@@ -318,8 +381,14 @@ export default function App() {
     }
   };
 
-  // Load attached Google Sheets dataset automatically on mount, and listen for Google Auth state
+  // Load attached Google Sheets dataset & persisted Road Hazards automatically on mount, and listen for Google Auth state
   useEffect(() => {
+    loadRoadHazardsAsync().then((savedHazards) => {
+      if (savedHazards && savedHazards.length > 0) {
+        setRoadHazards(savedHazards);
+      }
+    });
+
     runAutoSyncDatabase(null, null);
 
     const unsubscribe = initAuth(
@@ -584,6 +653,11 @@ export default function App() {
           window.scrollTo({ top: 0, behavior: 'smooth' });
         } else if (currentPrompt.actionType === 'DOWNLOAD_EXCEL') {
           downloadExcelTemplate(records, roadHazards);
+        } else if (
+          currentPrompt.actionType === 'VIEW_FULL_RESPONSE' &&
+          currentPrompt.targetRecord
+        ) {
+          setViewingFullRecord(currentPrompt.targetRecord);
         }
       }
     } catch (err) {
@@ -638,6 +712,18 @@ export default function App() {
       return;
     }
     setActiveTab(tab);
+  };
+
+  const handleRequestViewFullResponse = (rec: AssessmentRecord) => {
+    if (!user) {
+      setAuthRequiredPrompt({
+        isOpen: true,
+        actionType: 'VIEW_FULL_RESPONSE',
+        targetRecord: rec,
+      });
+      return;
+    }
+    setViewingFullRecord(rec);
   };
 
   const handleRequestEditRecord = (rec: AssessmentRecord) => {
@@ -708,10 +794,20 @@ export default function App() {
   };
 
   const handleDeleteRoadHazard = (hazardId: string) => {
-    setRoadHazards((prev) => prev.filter((h) => h.id !== hazardId));
+    const target = roadHazards.find((h) => h.id === hazardId);
+    setRoadHazards((prev) => {
+      const next = prev.filter((h) => h.id !== hazardId);
+      saveRoadHazardsLocally(next);
+      return next;
+    });
     if (selectedHazardId === hazardId) {
       setSelectedHazardId(null);
     }
+    showToast(
+      'ลบหมุดจุดเสี่ยงสำเร็จ',
+      `ลบหมุดจุดเสี่ยง "${target?.title || hazardId}" ออกจากแผนที่และฐานข้อมูลเรียบร้อยแล้ว`,
+      'INFO'
+    );
   };
 
   const handleUpdateRecordPhotos = async (
@@ -759,8 +855,15 @@ export default function App() {
     hazardId: string,
     status: RoadHazardStatus
   ) => {
-    setRoadHazards((prev) =>
-      prev.map((h) => (h.id === hazardId ? { ...h, status } : h))
+    setRoadHazards((prev) => {
+      const next = prev.map((h) => (h.id === hazardId ? { ...h, status } : h));
+      saveRoadHazardsLocally(next);
+      return next;
+    });
+    showToast(
+      'บันทึกสำเร็จ',
+      `อัปเดตสถานะหมุดจุดเสี่ยง ${hazardId} เป็น "${ROAD_HAZARD_STATUS_LABELS[status]}" เรียบร้อยแล้ว`,
+      'SUCCESS'
     );
   };
 
@@ -810,43 +913,130 @@ export default function App() {
     );
   };
 
-  const handleCreateRoadHazard = (e: React.FormEvent) => {
+  const handleCreateRoadHazard = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSavingHazard) return;
+
     const latNum = Number(newHazardLat);
     const lngNum = Number(newHazardLng);
     if (!newHazardTitle.trim() || isNaN(latNum) || isNaN(lngNum)) return;
 
-    const nextId = `HAZ-${String(roadHazards.length + 1).padStart(3, '0')}`;
-    const created: RoadHazardPoint = {
-      id: nextId,
-      title: newHazardTitle.trim(),
-      type: newHazardType,
-      severity: newHazardSeverity,
-      status: 'REPORTED',
-      lat: latNum,
-      lng: lngNum,
-      description:
-        newHazardDesc.trim() ||
-        ROAD_HAZARD_TYPE_LABELS[newHazardType],
-      recommendedAction:
-        newHazardAction.trim() ||
-        'ประสานกองช่าง อบต./เทศบาล และหมวดทางหลวงลงพื้นที่ตรวจสอบและแก้ไข',
-      responsibleAgency:
-        newHazardAgency.trim() || 'กองช่าง อบต./เทศบาล และหมวดทางหลวง',
-      reportedBy: user?.displayName || user?.email || 'เจ้าหน้าที่ชุดสำรวจภาคสนาม',
-      reportedDate: new Date().toISOString().slice(0, 10),
-      photoDataUrl: newHazardPhoto,
-    };
+    setIsSavingHazard(true);
+    setSavingHazardStep(
+      'กำลังประมวลผลพิกัด GPS และจัดเก็บข้อมูลลงฐานข้อมูลถาวร...'
+    );
 
-    setRoadHazards((prev) => [created, ...prev]);
-    setSelectedHazardId(created.id);
-    setSelectedRecordId(null);
-    setShowRoadHazardsLayer(true);
-    setIsAddingHazard(false);
-    setNewHazardTitle('');
-    setNewHazardDesc('');
-    setNewHazardAction('');
-    setNewHazardPhoto(undefined);
+    try {
+      // Short visual pause so user clearly sees the Saving Indicator state
+      await new Promise((resolve) => setTimeout(resolve, 420));
+
+      // Generate unique non-colliding HAZ-xxx ID
+      const existingNums = roadHazards
+        .map((h) => {
+          const m = h.id.match(/HAZ-(\d+)/i);
+          return m ? parseInt(m[1], 10) : 0;
+        })
+        .filter((n) => !isNaN(n));
+      const maxNum = existingNums.length > 0 ? Math.max(...existingNums) : 0;
+      const nextId = `HAZ-${String(maxNum + 1).padStart(3, '0')}`;
+
+      let driveFileId: string | undefined = undefined;
+      let driveViewLink: string | undefined = undefined;
+
+      // If signed in with Google email, also upload photo to Google Drive & sync to Google Sheets
+      if (user) {
+        try {
+          const token = await getAccessToken();
+          if (token) {
+            if (newHazardPhoto && newHazardPhoto.startsWith('data:image')) {
+              setSavingHazardStep(
+                'กำลังอัปโหลดรูปภาพจุดเสี่ยงขึ้น Google Drive...'
+              );
+              const driveRes = await uploadHazardPhotoToDrive(
+                token,
+                `road_hazard_${nextId}_${Date.now()}.jpg`,
+                newHazardPhoto,
+                `จุดเสี่ยงบนถนน: ${newHazardTitle.trim()} (${nextId})`
+              );
+              driveFileId = driveRes.fileId;
+              driveViewLink = driveRes.webViewLink;
+            }
+          }
+        } catch (driveErr) {
+          console.warn(
+            'Could not upload road hazard photo to Drive, keeping local IndexedDB copy:',
+            driveErr
+          );
+        }
+      }
+
+      const created: RoadHazardPoint = {
+        id: nextId,
+        title: newHazardTitle.trim(),
+        type: newHazardType,
+        severity: newHazardSeverity,
+        status: 'REPORTED',
+        lat: latNum,
+        lng: lngNum,
+        description:
+          newHazardDesc.trim() || ROAD_HAZARD_TYPE_LABELS[newHazardType],
+        recommendedAction:
+          newHazardAction.trim() ||
+          'ประสานกองช่าง อบต./เทศบาล และหมวดทางหลวงลงพื้นที่ตรวจสอบและแก้ไข',
+        responsibleAgency:
+          newHazardAgency.trim() || 'กองช่าง อบต./เทศบาล และหมวดทางหลวง',
+        reportedBy:
+          user?.displayName || user?.email || 'เจ้าหน้าที่ชุดสำรวจภาคสนาม',
+        reportedDate: new Date().toISOString().slice(0, 10),
+        photoDataUrl: newHazardPhoto,
+        driveFileId,
+        driveViewLink,
+      };
+
+      // Update React State and persist immediately to localStorage + IndexedDB
+      const nextList = [created, ...roadHazards];
+      setRoadHazards(nextList);
+      await saveRoadHazardsLocally(nextList);
+
+      // If connected to a Google Sheet and signed in, append to the Road Hazards sheet tab
+      if (user && provisionedSheet?.spreadsheetId) {
+        try {
+          const token = await getAccessToken();
+          if (token) {
+            setSavingHazardStep(
+              'กำลังซิงก์ข้อมูลลงแผ่นงาน ทะเบียนจุดเสี่ยงบนถนน (Google Sheets)...'
+            );
+            await appendRoadHazardToGoogleSheet(
+              token,
+              provisionedSheet.spreadsheetId,
+              created
+            );
+          }
+        } catch (sheetErr) {
+          console.warn('Could not append road hazard to Google Sheet:', sheetErr);
+        }
+      }
+
+      setSelectedHazardId(created.id);
+      setSelectedRecordId(null);
+      setShowRoadHazardsLayer(true);
+      setIsAddingHazard(false);
+      setNewHazardTitle('');
+      setNewHazardDesc('');
+      setNewHazardAction('');
+      setNewHazardPhoto(undefined);
+
+      showToast(
+        'บันทึกสำเร็จ',
+        `บันทึกหมุดจุดเสี่ยง "${created.title}" (${created.id})${
+          created.photoDataUrl ? ' พร้อมรูปภาพ' : ''
+        } ลงในแผนที่ GIS และฐานข้อมูลถาวรเรียบร้อยแล้ว (เปิดแอปใหม่ข้อมูลไม่สูญหาย)`,
+        'SUCCESS'
+      );
+    } finally {
+      setIsSavingHazard(false);
+      setSavingHazardStep('');
+    }
   };
 
   // Filtered records for Dashboard table and GIS map
@@ -1265,6 +1455,13 @@ export default function App() {
               onSelectRiskFilter={setRiskFilter}
             />
 
+            {/* Interactive Recharts Line Chart: Timeline of Risk Scores & Village Spatial Risk Comparison */}
+            <RiskTrendLineChart
+              records={records}
+              activeSearchQuery={searchQuery}
+              onSelectVillageFilter={(villageKeyword) => setSearchQuery(villageKeyword)}
+            />
+
             {/* Interactive GIS Map & Road Hazard Layer */}
             <div className="bg-white border border-slate-200 rounded-lg p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-3">
@@ -1507,9 +1704,62 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Attached Photo Preview & Saving Status Indicator */}
+                  {newHazardPhoto && (
+                    <div className="flex items-center gap-3 p-2.5 bg-white border border-emerald-200 rounded-lg">
+                      <img
+                        src={newHazardPhoto}
+                        alt="ตัวอย่างภาพถ่ายจุดเสี่ยง"
+                        className="w-20 h-14 object-cover rounded border border-slate-200 shrink-0"
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="font-semibold text-emerald-800 flex items-center gap-1">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span>พร้อมบันทึกภาพถ่ายจุดเสี่ยงลงฐานข้อมูลถาวร</span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          ระบบจะจัดเก็บรูปภาพลงฐานข้อมูลเครื่อง (IndexedDB/LocalStorage) และอัปโหลดขึ้น Google Drive อัตโนมัติเมื่อเข้าระบบด้วยอีเมล
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isSavingHazard}
+                        onClick={() => setNewHazardPhoto(undefined)}
+                        className="px-2 py-1 text-[11px] font-semibold text-red-600 hover:bg-red-50 rounded border border-red-200 shrink-0"
+                      >
+                        ลบรูป
+                      </button>
+                    </div>
+                  )}
+
+                  {isSavingHazard && (
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-lg bg-blue-50 border border-blue-200 text-blue-900 font-medium animate-pulse"
+                    >
+                      <Loader2 className="w-4 h-4 text-blue-700 animate-spin shrink-0" />
+                      <div className="flex-1">
+                        <div className="font-bold text-xs text-blue-900">
+                          กำลังบันทึกข้อมูลจุดเสี่ยงและพิกัด GPS...
+                        </div>
+                        <div className="text-[11px] text-blue-700">
+                          {savingHazardStep ||
+                            'กำลังส่งพิกัดไปยัง State และบันทึกลงฐานข้อมูลถาวร...'}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-amber-200">
                     <div className="flex items-center gap-2">
-                      <label className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded cursor-pointer font-semibold text-slate-700 hover:bg-slate-50">
+                      <label
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded font-semibold text-slate-700 hover:bg-slate-50 ${
+                          isSavingHazard
+                            ? 'opacity-50 pointer-events-none'
+                            : 'cursor-pointer'
+                        }`}
+                      >
                         <Camera className="w-3.5 h-3.5 text-blue-700" />
                         <span>
                           {newHazardPhoto
@@ -1520,22 +1770,35 @@ export default function App() {
                           type="file"
                           accept="image/*"
                           capture="environment"
+                          disabled={isSavingHazard}
                           onChange={handleHazardPhotoChange}
                           className="hidden"
                         />
                       </label>
                       {newHazardPhoto && (
-                        <span className="text-emerald-700 font-semibold">
-                          แนบรูปภาพจุดเสี่ยงแล้ว
+                        <span className="text-emerald-700 font-semibold flex items-center gap-1">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                          <span>แนบรูปภาพจุดเสี่ยงแล้ว</span>
                         </span>
                       )}
                     </div>
 
                     <button
                       type="submit"
-                      className="px-4 py-1.5 bg-blue-700 text-white font-semibold rounded hover:bg-blue-800"
+                      disabled={isSavingHazard}
+                      className="inline-flex items-center gap-2 px-4 py-2 bg-blue-700 text-white font-semibold rounded-md hover:bg-blue-800 disabled:opacity-70 disabled:cursor-wait shadow-xs transition-all cursor-pointer"
                     >
-                      บันทึกหมุดจุดเสี่ยงลงแผนที่ GIS
+                      {isSavingHazard ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>กำลังบันทึกพิกัดและรูปภาพ...</span>
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>บันทึกหมุดจุดเสี่ยงลงแผนที่ GIS</span>
+                        </>
+                      )}
                     </button>
                   </div>
                 </form>
@@ -1639,6 +1902,16 @@ export default function App() {
                               </button>
                             </div>
                           </div>
+                          {haz.photoDataUrl && (
+                            <div className="w-full h-24 rounded overflow-hidden border border-slate-200 bg-slate-100 my-1">
+                              <img
+                                src={haz.photoDataUrl}
+                                alt={haz.title}
+                                referrerPolicy="no-referrer"
+                                className="w-full h-full object-cover"
+                              />
+                            </div>
+                          )}
                           <div className="font-bold text-slate-900 line-clamp-1">
                             {haz.title}
                           </div>
@@ -1936,6 +2209,26 @@ export default function App() {
                                   type="button"
                                   title={
                                     user
+                                      ? 'ดูข้อมูลแบบประเมินฉบับสมบูรณ์ (ครบทั้ง 5 Sections · 30 ข้อ)'
+                                      : 'ต้องเข้าสู่ระบบด้วย Sign in with Google เพื่อดูแบบประเมิน 30 ข้อ'
+                                  }
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleRequestViewFullResponse(rec);
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-blue-800 bg-blue-50 border border-blue-200 rounded hover:bg-blue-100 whitespace-nowrap shrink-0"
+                                >
+                                  {user ? (
+                                    <FileText className="w-3 h-3 text-blue-700" />
+                                  ) : (
+                                    <Lock className="w-3 h-3 text-blue-700" />
+                                  )}
+                                  <span>แบบประเมิน 30 ข้อ</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  title={
+                                    user
                                       ? 'แก้ไขข้อมูลผู้สูงอายุรายนี้'
                                       : 'ต้องเข้าสู่ระบบผ่าน Email เพื่อแก้ไขข้อมูล'
                                   }
@@ -2067,6 +2360,15 @@ export default function App() {
         onClose={() => setPrintingRecord(null)}
       />
 
+      <FullAssessmentResponseModal
+        record={viewingFullRecord}
+        isAuthenticated={Boolean(user)}
+        userEmail={user?.email}
+        onLogin={handleGoogleLogin}
+        onEditRecord={handleRequestEditRecord}
+        onClose={() => setViewingFullRecord(null)}
+      />
+
       {/* Email Sign-In Gate Modal for Edit & Delete */}
       {authRequiredPrompt.isOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
@@ -2083,6 +2385,8 @@ export default function App() {
                     ? 'ต้อง Sign in with Google ก่อนเข้าถึงหน้า คู่มือ & .xlsx'
                     : authRequiredPrompt.actionType === 'DOWNLOAD_EXCEL'
                     ? 'ต้อง Sign in with Google ก่อนดาวน์โหลดไฟล์ .xlsx'
+                    : authRequiredPrompt.actionType === 'VIEW_FULL_RESPONSE'
+                    ? 'ต้อง Sign in with Google ก่อนดูแบบประเมิน 30 ข้อ'
                     : 'ต้องเข้าสู่ระบบผ่าน Email ก่อนดำเนินการ'}
                 </h3>
                 {authRequiredPrompt.actionType === 'WORKSPACE_ACCESS' ? (
@@ -2115,6 +2419,16 @@ export default function App() {
                     <strong className="text-slate-900">Sign in with Google</strong>{' '}
                     ก่อนเท่านั้น เมื่อลงชื่อเข้าใช้สำเร็จ ระบบจะดาวน์โหลดไฟล์ให้โดยอัตโนมัติ
                   </p>
+                ) : authRequiredPrompt.actionType === 'VIEW_FULL_RESPONSE' ? (
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    การเข้าดูข้อมูลคำตอบตามโครงสร้างคำถาม Google Forms ฉบับสมบูรณ์{' '}
+                    <strong className="text-slate-900">
+                      (ครบทั้ง 5 Sections · 30 ข้อ)
+                    </strong>{' '}
+                    ของผู้สูงอายุรายนี้ จำเป็นต้องลงชื่อเข้าใช้ผ่าน{' '}
+                    <strong className="text-slate-900">Sign in with Google</strong>{' '}
+                    ก่อนเท่านั้น เมื่อลงชื่อเข้าใช้สำเร็จ ระบบจะเปิดรายงานแบบประเมินฉบับเต็มให้ทันที
+                  </p>
                 ) : (
                   <p className="text-xs text-slate-600 leading-relaxed">
                     ระบบเปิดให้ทุกคนเข้าถึงและดูฐานข้อมูลได้โดยอัตโนมัติ แต่การ{' '}
@@ -2135,7 +2449,12 @@ export default function App() {
               <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs space-y-1">
                 <div className="text-slate-500 font-medium">
                   รายการที่ต้องการ
-                  {authRequiredPrompt.actionType === 'EDIT' ? 'แก้ไข' : 'ลบ'}:
+                  {authRequiredPrompt.actionType === 'EDIT'
+                    ? 'แก้ไข'
+                    : authRequiredPrompt.actionType === 'VIEW_FULL_RESPONSE'
+                    ? 'ดูแบบประเมิน 5 ส่วน (30 ข้อ)'
+                    : 'ลบ'}
+                  :
                 </div>
                 <div className="font-bold text-slate-900 text-sm">
                   {String(
@@ -2228,6 +2547,46 @@ export default function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Global Toast Notification ('บันทึกสำเร็จ') */}
+      {toastNotification && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed top-16 right-6 z-50 max-w-md w-full sm:w-96 bg-white border border-emerald-300 rounded-xl shadow-xl p-4 flex items-start gap-3 transition-all"
+        >
+          <div
+            className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+              toastNotification.variant === 'SUCCESS'
+                ? 'bg-emerald-100 text-emerald-700'
+                : 'bg-blue-100 text-blue-700'
+            }`}
+          >
+            <CheckCircle2 className="w-5 h-5" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <h4 className="text-sm font-bold text-slate-900">
+                {toastNotification.title}
+              </h4>
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+                Saved
+              </span>
+            </div>
+            <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+              {toastNotification.message}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setToastNotification(null)}
+            className="p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-100 shrink-0 cursor-pointer"
+            title="ปิดการแจ้งเตือน"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
     </div>

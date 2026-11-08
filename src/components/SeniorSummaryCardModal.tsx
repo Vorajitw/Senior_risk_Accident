@@ -245,6 +245,8 @@ export const SeniorSummaryCardModal: React.FC<SeniorSummaryCardModalProps> = ({
           quality: 1.0,
           pixelRatio: 2.5,
           backgroundColor: '#ffffff',
+          skipFonts: true,
+          fontEmbedCSS: '',
           style: {
             margin: '0',
             boxShadow: 'none',
@@ -256,6 +258,8 @@ export const SeniorSummaryCardModal: React.FC<SeniorSummaryCardModalProps> = ({
           quality: 1.0,
           pixelRatio: 2.5,
           backgroundColor: '#ffffff',
+          skipFonts: true,
+          fontEmbedCSS: '',
           style: {
             margin: '0',
             boxShadow: 'none',

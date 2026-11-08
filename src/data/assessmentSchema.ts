@@ -1525,6 +1525,8 @@ export interface RoadHazardPoint {
   reportedBy: string;
   reportedDate: string;
   photoDataUrl?: string;
+  driveFileId?: string;
+  driveViewLink?: string;
 }
 
 export const INITIAL_ROAD_HAZARDS: RoadHazardPoint[] = [

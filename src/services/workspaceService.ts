@@ -3,6 +3,13 @@ import {
   SECTIONS,
   AssessmentRecord,
   HazardPhotoAttachment,
+  RoadHazardPoint,
+  RoadHazardType,
+  RoadHazardSeverity,
+  RoadHazardStatus,
+  INITIAL_ROAD_HAZARDS,
+  ROAD_HAZARD_TYPE_LABELS,
+  ROAD_HAZARD_STATUS_LABELS,
   buildRecordFromAnswers,
   mapSheetColumnsToQuestions,
   parsePhotosFromSheetRow,
@@ -1187,5 +1194,404 @@ export async function findAndConnectUserGoogleSheet(
 
   return null;
 }
+
+// ============================================================================
+// Persistent Road Hazard Storage (localStorage + IndexedDB + Google Sheets/Drive)
+// ============================================================================
+
+const ROAD_HAZARDS_STORAGE_KEY = 'senior_risk_road_hazards_v1';
+const ROAD_HAZARDS_IDB_NAME = 'senior_risk_gis_storage_v1';
+const ROAD_HAZARDS_IDB_STORE = 'road_hazards_store';
+const ROAD_HAZARDS_SHEET_TAB = 'ทะเบียนจุดเสี่ยงบนถนน (Road Hazards)';
+
+function openHazardsIndexedDB(): Promise<IDBDatabase | null> {
+  if (typeof window === 'undefined' || !window.indexedDB) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    try {
+      const req = window.indexedDB.open(ROAD_HAZARDS_IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(ROAD_HAZARDS_IDB_STORE)) {
+          db.createObjectStore(ROAD_HAZARDS_IDB_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Synchronously loads initial road hazards from localStorage (falling back to INITIAL_ROAD_HAZARDS)
+ */
+export function loadRoadHazardsSync(): RoadHazardPoint[] {
+  try {
+    const raw = localStorage.getItem(ROAD_HAZARDS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed;
+      }
+    }
+  } catch {
+    // Fallback to INITIAL_ROAD_HAZARDS
+  }
+  return INITIAL_ROAD_HAZARDS;
+}
+
+/**
+ * Asynchronously loads full road hazards (including full high-res base64 photos) from IndexedDB or localStorage
+ */
+export async function loadRoadHazardsAsync(): Promise<RoadHazardPoint[]> {
+  try {
+    const db = await openHazardsIndexedDB();
+    if (db) {
+      const idbResult = await new Promise<RoadHazardPoint[] | null>((resolve) => {
+        try {
+          const tx = db.transaction(ROAD_HAZARDS_IDB_STORE, 'readonly');
+          const store = tx.objectStore(ROAD_HAZARDS_IDB_STORE);
+          const getReq = store.get('all_road_hazards');
+          getReq.onsuccess = () => {
+            if (Array.isArray(getReq.result) && getReq.result.length > 0) {
+              resolve(getReq.result as RoadHazardPoint[]);
+            } else {
+              resolve(null);
+            }
+          };
+          getReq.onerror = () => resolve(null);
+        } catch {
+          resolve(null);
+        }
+      });
+      if (idbResult && idbResult.length > 0) {
+        return idbResult;
+      }
+    }
+  } catch {
+    // Fallback to localStorage
+  }
+  return loadRoadHazardsSync();
+}
+
+/**
+ * Persists road hazards (with photos) to both localStorage and IndexedDB so data never disappears on reload
+ */
+export async function saveRoadHazardsLocally(
+  hazards: RoadHazardPoint[]
+): Promise<void> {
+  // 1. Save full array including base64 photos to IndexedDB (supports >50MB)
+  try {
+    const db = await openHazardsIndexedDB();
+    if (db) {
+      await new Promise<void>((resolve) => {
+        try {
+          const tx = db.transaction(ROAD_HAZARDS_IDB_STORE, 'readwrite');
+          const store = tx.objectStore(ROAD_HAZARDS_IDB_STORE);
+          store.put(hazards, 'all_road_hazards');
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
+    }
+  } catch {
+    // Ignore IDB errors
+  }
+
+  // 2. Save to localStorage for instant synchronous hydration on boot
+  try {
+    localStorage.setItem(ROAD_HAZARDS_STORAGE_KEY, JSON.stringify(hazards));
+  } catch {
+    // If base64 photos exceed 5MB localStorage limit, store lightweight version in localStorage while IDB holds full photos
+    try {
+      const lightweight = hazards.map((h) => ({
+        ...h,
+        photoDataUrl:
+          h.photoDataUrl && h.photoDataUrl.length > 120000
+            ? h.driveViewLink
+              ? toRenderableImageUrl(h.driveViewLink)
+              : undefined
+            : h.photoDataUrl,
+      }));
+      localStorage.setItem(
+        ROAD_HAZARDS_STORAGE_KEY,
+        JSON.stringify(lightweight)
+      );
+    } catch {
+      // Ignore quota error
+    }
+  }
+}
+
+/**
+ * Ensures the `ทะเบียนจุดเสี่ยงบนถนน (Road Hazards)` tab exists in the Google Sheet and appends a road hazard row
+ */
+export async function appendRoadHazardToGoogleSheet(
+  accessToken: string,
+  spreadsheetId: string,
+  hazard: RoadHazardPoint
+): Promise<void> {
+  const safeId = encodeURIComponent(spreadsheetId.trim());
+  const metaRes = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${safeId}`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    }
+  );
+  if (!metaRes.ok) {
+    throw new Error(`ไม่สามารถเข้าถึง Google Sheets ได้ (HTTP ${metaRes.status})`);
+  }
+  const meta = await metaRes.json();
+  const existingSheets: string[] = (meta?.sheets || []).map(
+    (s: any) => s?.properties?.title || ''
+  );
+
+  let hazardTabName =
+    existingSheets.find(
+      (t) => t.includes('จุดเสี่ยงบนถนน') || t.toLowerCase().includes('road hazard')
+    ) || ROAD_HAZARDS_SHEET_TAB;
+
+  // If the tab doesn't exist yet, create it and populate header row
+  if (!existingSheets.includes(hazardTabName)) {
+    const addSheetRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${safeId}:batchUpdate`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          requests: [
+            {
+              addSheet: {
+                properties: {
+                  title: hazardTabName,
+                  gridProperties: {
+                    rowCount: 300,
+                    columnCount: 15,
+                    frozenRowCount: 1,
+                  },
+                },
+              },
+            },
+          ],
+        }),
+      }
+    );
+
+    if (addSheetRes.ok) {
+      const headerRow = [
+        'รหัสจุดเสี่ยง (Hazard ID)',
+        'วันที่แจ้ง',
+        'ชื่อจุดเสี่ยง / ตำแหน่งสังเกต',
+        'ประเภทจุดเสี่ยง',
+        'ระดับความเร่งด่วน',
+        'สถานะการแก้ไข',
+        'Latitude',
+        'Longitude',
+        'รายละเอียดปัญหา',
+        'ข้อเสนอแนะเชิงวิศวกรรม',
+        'หน่วยงานรับผิดชอบ',
+        'ผู้แจ้ง',
+        'Google Maps Link',
+        'Photo Link (ภาพถ่ายจุดเสี่ยง)',
+      ];
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${safeId}/values/${encodeURIComponent(
+          `'${hazardTabName}'!A1`
+        )}?valueInputOption=USER_ENTERED`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ values: [headerRow] }),
+        }
+      );
+    }
+  }
+
+  const mapsLink = `https://www.google.com/maps?q=${hazard.lat},${hazard.lng}`;
+  const photoCellValue =
+    hazard.driveViewLink ||
+    (hazard.photoDataUrl && hazard.photoDataUrl.startsWith('http')
+      ? hazard.photoDataUrl
+      : '');
+
+  const rowValues = [
+    hazard.id,
+    hazard.reportedDate,
+    hazard.title,
+    `${hazard.type} (${ROAD_HAZARD_TYPE_LABELS[hazard.type] || hazard.type})`,
+    hazard.severity,
+    `${hazard.status} (${ROAD_HAZARD_STATUS_LABELS[hazard.status] || hazard.status})`,
+    hazard.lat,
+    hazard.lng,
+    hazard.description,
+    hazard.recommendedAction,
+    hazard.responsibleAgency,
+    hazard.reportedBy,
+    mapsLink,
+    photoCellValue,
+  ];
+
+  await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${safeId}/values/${encodeURIComponent(
+      `'${hazardTabName}'!A1`
+    )}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ values: [rowValues] }),
+    }
+  );
+}
+
+/**
+ * Fetches road hazards from the `ทะเบียนจุดเสี่ยงบนถนน` tab in Google Sheets if present,
+ * hydrating any Google Drive photo links using the user's OAuth token.
+ */
+export async function fetchRoadHazardsFromGoogleSheet(
+  accessToken: string,
+  spreadsheetId: string
+): Promise<RoadHazardPoint[]> {
+  try {
+    const safeId = encodeURIComponent(spreadsheetId.trim());
+    const metaRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${safeId}`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }
+    );
+    if (!metaRes.ok) return [];
+    const meta = await metaRes.json();
+    const existingSheets: string[] = (meta?.sheets || []).map(
+      (s: any) => s?.properties?.title || ''
+    );
+
+    const hazardTabName = existingSheets.find(
+      (t) => t.includes('จุดเสี่ยงบนถนน') || t.toLowerCase().includes('road hazard')
+    );
+    if (!hazardTabName) return [];
+
+    const rangeEncoded = encodeURIComponent(`'${hazardTabName}'!A1:N300`);
+    const valRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${safeId}/values/${rangeEncoded}`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }
+    );
+    if (!valRes.ok) return [];
+    const valData = await valRes.json();
+    const rows: string[][] = valData.values || [];
+    if (rows.length < 2) return [];
+
+    const parsedHazards: RoadHazardPoint[] = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || r.length < 3) continue;
+      const id = String(r[0] || `HAZ-${String(i).padStart(3, '0')}`).trim();
+      const reportedDate = String(r[1] || '').trim() || new Date().toISOString().slice(0, 10);
+      const title = String(r[2] || '').trim();
+      if (!title) continue;
+
+      const rawType = String(r[3] || '').toUpperCase();
+      const type: RoadHazardType = rawType.includes('BROKEN_BRIDGE') || rawType.includes('สะพาน')
+        ? 'BROKEN_BRIDGE'
+        : rawType.includes('HIGH_SPEED') || rawType.includes('ความเร็ว')
+        ? 'HIGH_SPEED_ZONE'
+        : rawType.includes('POOR_LIGHTING') || rawType.includes('อับแสง')
+        ? 'POOR_LIGHTING'
+        : rawType.includes('NO_REFUGE') || rawType.includes('เกาะกลาง')
+        ? 'NO_REFUGE_ISLAND'
+        : 'BLIND_SPOT';
+
+      const rawSev = String(r[4] || '').toUpperCase();
+      const severity: RoadHazardSeverity =
+        rawSev.includes('WARNING') || rawSev.includes('เฝ้าระวัง')
+          ? 'WARNING'
+          : 'CRITICAL';
+
+      const rawStatus = String(r[5] || '').toUpperCase();
+      const status: RoadHazardStatus =
+        rawStatus.includes('RESOLVED') || rawStatus.includes('เรียบร้อย')
+          ? 'RESOLVED'
+          : rawStatus.includes('IN_PROGRESS') || rawStatus.includes('กำลังประสาน')
+          ? 'IN_PROGRESS'
+          : 'REPORTED';
+
+      const lat = Number(r[6]);
+      const lng = Number(r[7]);
+      if (isNaN(lat) || isNaN(lng)) continue;
+
+      const description = String(r[8] || '').trim() || ROAD_HAZARD_TYPE_LABELS[type];
+      const recommendedAction = String(r[9] || '').trim();
+      const responsibleAgency = String(r[10] || '').trim();
+      const reportedBy = String(r[11] || '').trim();
+      const rawPhotoLink = String(r[13] || '').trim();
+
+      let photoDataUrl: string | undefined = undefined;
+      let driveFileId: string | undefined = undefined;
+      let driveViewLink: string | undefined = undefined;
+
+      if (rawPhotoLink) {
+        driveViewLink = rawPhotoLink;
+        const extractedId = extractDriveFileId(rawPhotoLink);
+        if (extractedId) {
+          driveFileId = extractedId;
+          const hydratedList = await hydrateDrivePhotosWithToken(accessToken, [
+            {
+              id: `haz-photo-${id}`,
+              category: 'OTHER',
+              categoryLabel: 'จุดเสี่ยงบนถนน',
+              caption: title,
+              dataUrl: toRenderableImageUrl(rawPhotoLink),
+              driveFileId: extractedId,
+              driveViewLink: rawPhotoLink,
+              capturedAt: reportedDate,
+            },
+          ]);
+          photoDataUrl = hydratedList[0]?.dataUrl || toRenderableImageUrl(rawPhotoLink);
+        } else {
+          photoDataUrl = toRenderableImageUrl(rawPhotoLink);
+        }
+      }
+
+      parsedHazards.push({
+        id,
+        title,
+        type,
+        severity,
+        status,
+        lat,
+        lng,
+        description,
+        recommendedAction,
+        responsibleAgency,
+        reportedBy,
+        reportedDate,
+        photoDataUrl,
+        driveFileId,
+        driveViewLink,
+      });
+    }
+
+    return parsedHazards;
+  } catch {
+    return [];
+  }
+}
+
 
 
